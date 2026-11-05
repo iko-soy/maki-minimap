@@ -1,0 +1,836 @@
+diff --git a/maki-lua/src/api/fn.rs b/maki-lua/src/api/fn.rs
+index 727b1bc..cc7a068 100644
+--- a/maki-lua/src/api/fn.rs
++++ b/maki-lua/src/api/fn.rs
+@@ -23,7 +23,7 @@ use tokio::time::sleep;
+ 
+ use crate::api::fs::{Line, MAX_READ_BYTES, expand_tilde, next_line};
+ use crate::api::keymap::{InputMode, KeymapWriter};
+-use crate::api::util::command::{UiAction, ui_roundtrip, ui_send};
++use crate::api::util::command::{UiAction, WinScrollTarget, ui_roundtrip, ui_send};
+ use crate::api::util::convert::TableExt;
+ use crate::api::util::pair::{Pair, err_pair, try_pair};
+ use crate::plugin_permissions::{Ceiling, Permission, PluginPermissions, require};
+@@ -1538,7 +1538,11 @@ fn executable(_lua: &Lua, name: String) -> LuaResult<i32> {
+ /// `auto_scroll` has no Vim counterpart: it is true while the transcript
+ /// follows streaming output.
+ ///
+-/// @return (table|nil, string|nil) `{topline, line_count, height, auto_scroll}`, or nil and an error.
++/// `width` is the transcript's layout width. `anchor_revision` is a string
++/// token that changes when a message anchor or its layout changes; clients can
++/// use it to avoid fetching unchanged anchors on every viewport poll.
++///
++/// @return (table|nil, string|nil) `{topline, line_count, height, width, auto_scroll, anchor_revision}`, or nil and an error.
+ /// @example
+ /// local view = maki.fn.winsaveview()
+ /// maki.fn.winrestview({ topline = view.topline + 1 })
+@@ -1553,31 +1557,82 @@ async fn winsaveview(
+     t.set("topline", i64::from(view.scroll_top) + 1)?;
+     t.set("line_count", view.line_count)?;
+     t.set("height", view.height)?;
++    t.set("width", view.width)?;
+     t.set("auto_scroll", view.auto_scroll)?;
++    t.set("anchor_revision", format!("{:016x}", view.anchor_revision))?;
+     Ok((Some(t), None))
+ }
+ 
++/// Read message anchors from the focused display transcript, oldest first.
++/// Each entry has `{message_index, role, preview, topline, height}`. Indexes
++/// and toplines are one-based. `message_index` addresses this display
++/// transcript, not the raw session log, and can be passed to `winrestview`.
++/// `preview` is the message's first line, truncated to 80 Unicode characters.
++/// `height` is the exact rendered segment height at the current width.
++///
++/// Requires the `session_read` [plugin permission](#plugin-permissions).
++///
++/// @return (table|nil, string|nil) Array of anchor tables, or nil and an error.
++/// @example
++/// local anchors = maki.fn.transcript_anchors()
++/// for _, anchor in ipairs(anchors or {}) do
++///   if anchor.role == "user" then print(anchor.preview) end
++/// end
++#[lua_fn(guard = SessionRead)]
++async fn transcript_anchors(
++    lua: Lua,
++    #[ctx] tx: Option<flume::Sender<UiAction>>,
++) -> LuaResult<Pair<Table>> {
++    let anchors = try_pair!(
++        ui_roundtrip(tx.as_ref(), |reply_tx| UiAction::TranscriptAnchors {
++            reply_tx
++        })
++        .await
++    );
++    let out = lua.create_table_with_capacity(anchors.len(), 0)?;
++    for (index, anchor) in anchors.into_iter().enumerate() {
++        let item = lua.create_table()?;
++        item.set("message_index", anchor.message_index.saturating_add(1))?;
++        item.set("role", anchor.role)?;
++        item.set("preview", anchor.preview)?;
++        item.set("topline", i64::from(anchor.topline) + 1)?;
++        item.set("height", anchor.height)?;
++        out.raw_set(index + 1, item)?;
++    }
++    Ok((Some(out), None))
++}
++
+ /// Scroll the focused chat transcript so that the `topline` field of
+ /// {view} becomes the top visible line, like Neovim's
+ /// `vim.fn.winrestview()`. Out of range values are clamped. Other keys are
+ /// ignored, so a table straight from `winsaveview()` round-trips.
++/// Alternatively, `message_index` selects a one-based index returned by
++/// `transcript_anchors` and takes precedence over `topline`. A stale message
++/// index that is no longer in the display transcript does nothing.
+ ///
+ /// Scrolling away from the bottom unpins the transcript; landing back at
+ /// the bottom re-pins it so streaming output keeps following.
+ ///
+-/// @param view table View to restore. Only `topline` (1-based) is read.
++/// @param view table View to restore. `topline` and `message_index` are one-based.
+ /// @return (boolean|nil, string|nil) true on success, or nil and an error.
+ /// @example
+ /// maki.fn.winrestview({ topline = 1 })
++/// maki.fn.winrestview({ message_index = 3 })
+ #[lua_fn]
+ fn winrestview(
+     _lua: &Lua,
+     #[ctx] tx: Option<flume::Sender<UiAction>>,
+     view: Table,
+ ) -> LuaResult<Pair<bool>> {
+-    let topline = view.opt::<i64>("topline")?.unwrap_or(1);
+-    let scroll_top = topline.saturating_sub(1).clamp(0, i64::from(u32::MAX)) as u32;
+-    try_pair!(ui_send(tx.as_ref(), UiAction::WinRestView { scroll_top }));
++    let target = if let Some(index) = view.opt::<i64>("message_index")? {
++        let message_index = usize::try_from(index.saturating_sub(1).max(0)).unwrap_or(usize::MAX);
++        WinScrollTarget::Message(message_index)
++    } else {
++        let topline = view.opt::<i64>("topline")?.unwrap_or(1);
++        let scroll_top = topline.saturating_sub(1).clamp(0, i64::from(u32::MAX)) as u32;
++        WinScrollTarget::Row(scroll_top)
++    };
++    try_pair!(ui_send(tx.as_ref(), UiAction::WinRestView { target }));
+     Ok((Some(true), None))
+ }
+ 
+@@ -1618,7 +1673,7 @@ lua_table! {
+         jobwait(perms, plugin), jobinfo(perms, plugin), joblist(perms, plugin),
+         jobattach(perms, plugin), jobfind(perms, plugin),
+         executable(perms),
+-        winsaveview(tx), winrestview(tx), mode,
++        winsaveview(tx), transcript_anchors(perms, tx), winrestview(tx), mode,
+     ]
+ }
+ 
+@@ -1627,7 +1682,7 @@ mod tests {
+     use super::*;
+     #[cfg(unix)]
+     use crate::api::fs::LINE_CUT_MARKER;
+-    use crate::api::util::command::{NO_UI_ERR, WinView};
++    use crate::api::util::command::{NO_UI_ERR, TranscriptAnchor, WinView};
+ 
+     const TEST_PLUGIN: &str = "test-plugin";
+     const JOB_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
+@@ -1980,12 +2035,14 @@ mod tests {
+         let lua = Lua::new();
+         let t = lua.create_table().unwrap();
+         winsaveview__register(&t, &lua, tx.clone()).unwrap();
++        transcript_anchors__register(&t, &lua, &PluginPermissions::trusted(), tx.clone()).unwrap();
+         winrestview__register(&t, &lua, tx).unwrap();
+         lua.globals().set("f", t).unwrap();
+         lua
+     }
+ 
+     #[test_case::test_case("return f.winsaveview()" ; "winsaveview")]
++    #[test_case::test_case("return f.transcript_anchors()" ; "transcript_anchors")]
+     #[test_case::test_case("return f.winrestview({ topline = 3 })" ; "winrestview")]
+     #[tokio::test]
+     async fn view_without_ui_returns_error_pair(code: &str) {
+@@ -2000,6 +2057,9 @@ mod tests {
+         const SCROLL_TOP: u32 = 6;
+         const LINE_COUNT: u32 = 100;
+         const HEIGHT: u16 = 24;
++        const WIDTH: u16 = 79;
++        const REVISION: u64 = 0x0123_4567_89ab_cdef;
++        const REVISION_TEXT: &str = "0123456789abcdef";
+ 
+         let (tx, rx) = flume::unbounded::<UiAction>();
+         let lua = lua_with_view(Some(tx));
+@@ -2012,7 +2072,9 @@ mod tests {
+                     scroll_top: SCROLL_TOP,
+                     line_count: LINE_COUNT,
+                     height: HEIGHT,
++                    width: WIDTH,
+                     auto_scroll: false,
++                    anchor_revision: REVISION,
+                 })
+                 .unwrap();
+         });
+@@ -2025,7 +2087,60 @@ mod tests {
+         assert_eq!(view.get::<u32>("topline").unwrap(), SCROLL_TOP + 1);
+         assert_eq!(view.get::<u32>("line_count").unwrap(), LINE_COUNT);
+         assert_eq!(view.get::<u16>("height").unwrap(), HEIGHT);
++        assert_eq!(view.get::<u16>("width").unwrap(), WIDTH);
+         assert!(!view.get::<bool>("auto_scroll").unwrap());
++        assert_eq!(
++            view.get::<String>("anchor_revision").unwrap(),
++            REVISION_TEXT
++        );
++    }
++
++    #[tokio::test]
++    async fn transcript_anchors_reports_one_based_display_indexes() {
++        let (tx, rx) = flume::unbounded::<UiAction>();
++        let lua = lua_with_view(Some(tx));
++        std::thread::spawn(move || {
++            let Ok(UiAction::TranscriptAnchors { reply_tx }) = rx.recv() else {
++                panic!("expected transcript anchors request");
++            };
++            reply_tx
++                .send(vec![TranscriptAnchor {
++                    message_index: 1,
++                    role: "user",
++                    preview: "hello".into(),
++                    topline: 4,
++                    height: 2,
++                }])
++                .unwrap();
++        });
++        let (anchors, err): (Table, Option<String>) = lua
++            .load("return f.transcript_anchors()")
++            .eval_async()
++            .await
++            .unwrap();
++        assert_eq!(err, None);
++        assert_eq!(anchors.raw_len(), 1);
++        let anchor = anchors.raw_get::<Table>(1).unwrap();
++        assert_eq!(anchor.get::<usize>("message_index").unwrap(), 2);
++        assert_eq!(anchor.get::<String>("role").unwrap(), "user");
++        assert_eq!(anchor.get::<String>("preview").unwrap(), "hello");
++        assert_eq!(anchor.get::<u32>("topline").unwrap(), 5);
++        assert_eq!(anchor.get::<u16>("height").unwrap(), 2);
++    }
++
++    #[tokio::test]
++    async fn transcript_anchors_requires_session_read() {
++        const DENIED: &str = "permission denied";
++        let lua = Lua::new();
++        let table = lua.create_table().unwrap();
++        transcript_anchors__register(&table, &lua, &PluginPermissions::denied(), None).unwrap();
++        lua.globals().set("f", table).unwrap();
++        let err = lua
++            .load("return f.transcript_anchors()")
++            .eval_async::<Value>()
++            .await
++            .unwrap_err();
++        assert!(err.to_string().contains(DENIED), "{err}");
+     }
+ 
+     #[test_case::test_case("{ topline = 12 }", 11 ; "explicit_topline")]
+@@ -2042,10 +2157,30 @@ mod tests {
+             .unwrap();
+         assert!(ok);
+         assert_eq!(err, None);
+-        let Ok(UiAction::WinRestView { scroll_top }) = rx.recv() else {
++        let Ok(UiAction::WinRestView { target }) = rx.recv() else {
++            panic!("expected winrestview request");
++        };
++        assert_eq!(target, WinScrollTarget::Row(expected));
++    }
++
++    #[test_case::test_case("{ message_index = 3 }", 2 ; "message_index")]
++    #[test_case::test_case("{ message_index = 0 }", 0 ; "below_range_message_clamps_to_first")]
++    #[test_case::test_case("{ message_index = 2, topline = 99 }", 1 ; "message_takes_precedence")]
++    #[tokio::test]
++    async fn winrestview_forwards_message_targets(arg: &str, expected: usize) {
++        let (tx, rx) = flume::unbounded::<UiAction>();
++        let lua = lua_with_view(Some(tx));
++        let (ok, err): (bool, Option<String>) = lua
++            .load(format!("return f.winrestview({arg})"))
++            .eval_async()
++            .await
++            .unwrap();
++        assert!(ok);
++        assert_eq!(err, None);
++        let Ok(UiAction::WinRestView { target }) = rx.recv() else {
+             panic!("expected winrestview request");
+         };
+-        assert_eq!(scroll_top, expected);
++        assert_eq!(target, WinScrollTarget::Message(expected));
+     }
+ 
+     #[tokio::test]
+diff --git a/maki-lua/src/api/util/command.rs b/maki-lua/src/api/util/command.rs
+index 6caf696..b1d3f30 100644
+--- a/maki-lua/src/api/util/command.rs
++++ b/maki-lua/src/api/util/command.rs
+@@ -697,6 +697,24 @@ pub enum InputRequest {
+ 
+ pub type UiReply = Result<serde_json::Value, String>;
+ 
++/// A message's place in the rendered transcript. Indexes and rows are
++/// zero-based here; the Lua API converts both to one-based values. The index
++/// addresses the focused display transcript, not the raw session log.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct TranscriptAnchor {
++    pub message_index: usize,
++    pub role: &'static str,
++    pub preview: String,
++    pub topline: u32,
++    pub height: u16,
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum WinScrollTarget {
++    Row(u32),
++    Message(usize),
++}
++
+ /// Viewport of the focused chat transcript, zero-based like the rest of the
+ /// UI; `maki.fn.winsaveview` is what puts it in Vim's 1-based shape.
+ /// `auto_scroll` is true while the transcript follows streaming output.
+@@ -704,7 +722,9 @@ pub struct WinView {
+     pub scroll_top: u32,
+     pub line_count: u32,
+     pub height: u16,
++    pub width: u16,
+     pub auto_scroll: bool,
++    pub anchor_revision: u64,
+ }
+ 
+ /// Lua sees these through `maki.ui.action` as the snake_case variant
+@@ -819,8 +839,11 @@ pub enum UiAction {
+     WinSaveView {
+         reply_tx: flume::Sender<WinView>,
+     },
++    TranscriptAnchors {
++        reply_tx: flume::Sender<Vec<TranscriptAnchor>>,
++    },
+     WinRestView {
+-        scroll_top: u32,
++        target: WinScrollTarget,
+     },
+     /// `reply_tx` answers whether the action did anything, which is what lets
+     /// a key handler try one action and fall back to another.
+@@ -1082,7 +1105,15 @@ mod tests {
+ 
+         // `/reload` builds a new loop around the same handles.
+         attachment.attach();
+-        assert!(ui_send(Some(&tx), UiAction::WinRestView { scroll_top: 0 }).is_ok());
++        assert!(
++            ui_send(
++                Some(&tx),
++                UiAction::WinRestView {
++                    target: WinScrollTarget::Row(0),
++                }
++            )
++            .is_ok()
++        );
+     }
+ 
+     /// The load is refused, while a task that runs as the load waits is not.
+diff --git a/maki-lua/src/lib.rs b/maki-lua/src/lib.rs
+index 5900102..76b5dc5 100644
+--- a/maki-lua/src/lib.rs
++++ b/maki-lua/src/lib.rs
+@@ -33,7 +33,8 @@ pub use api::util::command::{
+     HintReader, HintSnapshot, InputDecorate, InputEdit, InputMarks, InputRequest, InputSubmit,
+     LuaCommandInfo, LuaCommandReader, ModelRequest, NO_UI_ERR, PlanActionOutcome, PlanFormRow,
+     PlanMenu, PlanRequest, PlanRowAction, SessionRequest, Split, TaskRequest, TextEdit, TitlePos,
+-    UiAction, UiAttachment, UiReply, WinCommand, WinEvent, WinView,
++    TranscriptAnchor, UiAction, UiAttachment, UiReply, WinCommand, WinEvent, WinScrollTarget,
++    WinView,
+ };
+ pub use docs::{DocKind, FnDoc, ModuleDoc, ParamDoc, api_docs};
+ pub use error::PluginError;
+diff --git a/maki-ui/src/app/mod.rs b/maki-ui/src/app/mod.rs
+index c8a5c5a..292ed5e 100644
+--- a/maki-ui/src/app/mod.rs
++++ b/maki-ui/src/app/mod.rs
+@@ -75,8 +75,8 @@ use maki_lua::{
+     BuiltinAction, EventHandle, HintReader, HintSnapshot, InputDecorate, InputEdit, InputMarks,
+     InputMode, InputRule, InputRulesReader, InputSnapshot, InputSubmit, Key, KeymapReader,
+     LuaCommandReader, PLAN_FORM_SLOT_DEADLINE, PLAN_ROW_HANDLER_DEADLINE, PackCommand,
+-    PackPreparation, Permission, PlanActionOutcome, PlanMenu, PlanRowAction, PluginReach, WinView,
+-    is_reserved,
++    PackPreparation, Permission, PlanActionOutcome, PlanMenu, PlanRowAction, PluginReach,
++    TranscriptAnchor, WinView, is_reserved,
+ };
+ use maki_providers::models_cache::ModelList;
+ use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, TokenUsage, add_cost};
+@@ -1266,6 +1266,14 @@ impl App {
+         self.active_chat().scroll_to_row(doc_row);
+     }
+ 
++    pub(crate) fn scroll_to_message(&mut self, message_index: usize) -> bool {
++        self.active_chat().scroll_to_message(message_index)
++    }
++
++    pub(crate) fn transcript_anchors(&self) -> Vec<TranscriptAnchor> {
++        self.chats[self.active_chat].transcript_anchors()
++    }
++
+     fn clear_selection_unless_pending_copy(&mut self) {
+         if !self
+             .selection_state
+diff --git a/maki-ui/src/chat.rs b/maki-ui/src/chat.rs
+index 1b84e31..5a794cb 100644
+--- a/maki-ui/src/chat.rs
++++ b/maki-ui/src/chat.rs
+@@ -22,7 +22,7 @@ use maki_agent::{
+     ToolOutput, ToolStartEvent, display_order, observation_detail,
+ };
+ use maki_config::{ToolKey, ToolOutputLines, UiConfig};
+-use maki_lua::{LuaCommandInfo, WinView};
++use maki_lua::{LuaCommandInfo, TranscriptAnchor, WinView};
+ use maki_providers::{ContentBlock, ImageSource, Message, RequestOptions, Role};
+ use maki_storage::id::MakiId;
+ use ratatui::Frame;
+@@ -386,6 +386,10 @@ impl Chat {
+         self.messages_panel.scroll_to_row(doc_row);
+     }
+ 
++    pub fn scroll_to_message(&mut self, message_index: usize) -> bool {
++        self.messages_panel.scroll_to_message(message_index)
++    }
++
+     pub fn half_page(&self) -> i32 {
+         self.messages_panel.half_page()
+     }
+@@ -398,6 +402,10 @@ impl Chat {
+         self.messages_panel.win_view()
+     }
+ 
++    pub fn transcript_anchors(&self) -> Vec<TranscriptAnchor> {
++        self.messages_panel.transcript_anchors()
++    }
++
+     pub fn auto_scroll(&self) -> bool {
+         self.messages_panel.auto_scroll()
+     }
+diff --git a/maki-ui/src/components/messages/mod.rs b/maki-ui/src/components/messages/mod.rs
+index 2e30cab..608e53b 100644
+--- a/maki-ui/src/components/messages/mod.rs
++++ b/maki-ui/src/components/messages/mod.rs
+@@ -33,7 +33,9 @@ use crate::update;
+ use maki_config::{ClockFormat, ThinkingLines, ToolOutputLines, UiConfig};
+ use ratatui_image::picker::Picker;
+ 
++use std::collections::hash_map::DefaultHasher;
+ use std::collections::{HashMap, HashSet, VecDeque};
++use std::hash::{Hash, Hasher};
+ use std::mem;
+ use std::sync::Arc;
+ use std::time::{Duration, Instant};
+@@ -45,7 +47,7 @@ use maki_agent::{
+     BufWatch, BufferSnapshot, EventSender, ImageSource, InstructionBlock, NO_FILES_FOUND,
+     SharedBuf, ToolDoneEvent, ToolOutput, ToolStartEvent,
+ };
+-use maki_lua::{EventHandle, LuaCommandInfo, WARM_TOOL_CAP, WinView};
++use maki_lua::{EventHandle, LuaCommandInfo, TranscriptAnchor, WARM_TOOL_CAP, WinView};
+ use maki_storage::id::{MakiId, SessionRef};
+ 
+ use ratatui::Frame;
+@@ -64,6 +66,7 @@ const CLICKABLE: bool = true;
+ const NOTICE_COLLAPSED_MARK: &str = " ▸";
+ const NOTICE_EXPANDED_MARK: &str = " ▾";
+ const NOTICE_DETAIL_INDENT: &str = "  ";
++const ANCHOR_PREVIEW_CHARS: usize = 80;
+ 
+ /// What a click in the transcript asks of the app.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+@@ -727,6 +730,19 @@ impl MessagesPanel {
+         });
+     }
+ 
++    pub fn scroll_to_message(&mut self, message_index: usize) -> bool {
++        let Some(segment_index) = self
++            .cache
++            .segments()
++            .iter()
++            .position(|seg| seg.msg_index == Some(message_index))
++        else {
++            return false;
++        };
++        self.scroll_to_segment(segment_index);
++        true
++    }
++
+     /// Backs `maki.fn.winrestview`, the one caller that still speaks in
+     /// document rows.
+     pub fn scroll_to_row(&mut self, doc_row: u32) {
+@@ -1158,6 +1174,43 @@ impl MessagesPanel {
+         }
+     }
+ 
++    fn for_each_anchor(&self, mut visit: impl FnMut(usize, &DisplayMessage, u32, u16)) {
++        for (seg, topline, height) in self.layout().segment_rows() {
++            if let Some((message_index, message)) = seg
++                .msg_index
++                .and_then(|index| self.messages.get(index).map(|msg| (index, msg)))
++            {
++                visit(message_index, message, topline, height);
++            }
++        }
++    }
++
++    pub fn transcript_anchors(&self) -> Vec<TranscriptAnchor> {
++        let mut anchors = Vec::new();
++        self.for_each_anchor(|message_index, message, topline, height| {
++            anchors.push(TranscriptAnchor {
++                message_index,
++                role: display_role_name(&message.role),
++                preview: anchor_preview(message),
++                topline,
++                height,
++            });
++        });
++        anchors
++    }
++
++    fn anchor_revision(&self) -> u64 {
++        let mut hasher = DefaultHasher::new();
++        self.viewport_width.hash(&mut hasher);
++        self.for_each_anchor(|message_index, message, topline, height| {
++            message_index.hash(&mut hasher);
++            display_role_name(&message.role).hash(&mut hasher);
++            topline.hash(&mut hasher);
++            height.hash(&mut hasher);
++        });
++        hasher.finish()
++    }
++
+     /// Backs `maki.fn.winsaveview`. The clamp matters: a pinned or restored
+     /// scroll position can sit past the end until the next `view` resolves it
+     /// against the current line count.
+@@ -1168,7 +1221,9 @@ impl MessagesPanel {
+             scroll_top: layout.doc_row(layout.clamp(self.scroll.min(bottom))),
+             line_count: layout.total_rows(),
+             height: self.viewport_height,
++            width: self.viewport_width,
+             auto_scroll: self.auto_scroll,
++            anchor_revision: self.anchor_revision(),
+         }
+     }
+ 
+@@ -1719,6 +1774,29 @@ fn message_images(
+         })
+ }
+ 
++fn display_role_name(role: &DisplayRole) -> &'static str {
++    match role {
++        DisplayRole::User => "user",
++        DisplayRole::Assistant => "assistant",
++        DisplayRole::Thinking => "thinking",
++        DisplayRole::Tool(_) => "tool",
++        DisplayRole::Error => "error",
++        DisplayRole::Done => "done",
++        DisplayRole::Notice => "notice",
++    }
++}
++
++fn anchor_preview(message: &DisplayMessage) -> String {
++    message
++        .text
++        .lines()
++        .next()
++        .unwrap_or("")
++        .chars()
++        .take(ANCHOR_PREVIEW_CHARS)
++        .collect()
++}
++
+ fn message_style(role: &DisplayRole) -> RoleStyle {
+     match role {
+         DisplayRole::User => user_style(),
+diff --git a/maki-ui/src/components/messages/scroll.rs b/maki-ui/src/components/messages/scroll.rs
+index dfffd6e..92e3e99 100644
+--- a/maki-ui/src/components/messages/scroll.rs
++++ b/maki-ui/src/components/messages/scroll.rs
+@@ -1,4 +1,4 @@
+-use super::segment::SegmentCache;
++use super::segment::{Segment, SegmentCache};
+ 
+ /// Top of the viewport as a place in the document. `seg` indexes the segment
+ /// cache, streaming segments included.
+@@ -111,6 +111,15 @@ impl<'a> Layout<'a> {
+         self.doc_row(self.end())
+     }
+ 
++    pub fn segment_rows(&self) -> impl Iterator<Item = (&Segment, u32, u16)> + '_ {
++        self.cache.segments().iter().scan(0_u32, |row, seg| {
++            let doc_row = *row;
++            let height = seg.height(self.width);
++            *row = (*row).saturating_add(u32::from(height));
++            Some((seg, doc_row, height))
++        })
++    }
++
+     /// The inverse of [`Self::doc_row`], needed only by `winrestview`.
+     pub fn at_row(&self, doc_row: u32) -> ScrollPos {
+         self.advance(ScrollPos::default(), doc_row)
+@@ -168,6 +177,17 @@ mod tests {
+         assert_eq!(layout.bottom(2), pos(2, 2));
+     }
+ 
++    #[test]
++    fn segment_rows_walks_cached_heights_once() {
++        let cache = cache(&[3, 1, 4]);
++        let layout = Layout::new(&cache, WIDTH);
++        let rows: Vec<(u32, u16)> = layout
++            .segment_rows()
++            .map(|(_, doc_row, height)| (doc_row, height))
++            .collect();
++        assert_eq!(rows, [(0, 3), (3, 1), (4, 4)]);
++    }
++
+     #[test_case(pos(0, 2), pos(1, 1), 2 ; "counts_rows_between")]
+     #[test_case(pos(1, 1), pos(0, 2), 0 ; "target_above_never_underflows")]
+     fn rows_from_counts_down(from: ScrollPos, to: ScrollPos, expected: u32) {
+diff --git a/maki-ui/src/components/messages/tests.rs b/maki-ui/src/components/messages/tests.rs
+index 7d6678d..62eb5b2 100644
+--- a/maki-ui/src/components/messages/tests.rs
++++ b/maki-ui/src/components/messages/tests.rs
+@@ -870,6 +870,108 @@ fn set_tool_turn_usage_updates_exact_tool_and_keeps_annotation() {
+     assert_eq!(panel.messages[0].annotation.as_deref(), Some(MODEL));
+ }
+ 
++fn anchored_panel() -> MessagesPanel {
++    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
++    panel.messages = vec![
++        DisplayMessage::new(DisplayRole::User, "user preview".into()),
++        DisplayMessage::new(DisplayRole::Assistant, "assistant preview".into()),
++    ];
++    panel.cache.push(Segment::with_lines(
++        vec![Line::raw("user one"), Line::raw("user two")],
++        Some(0),
++    ));
++    panel.cache.push(Segment::spacer());
++    panel
++        .cache
++        .push(Segment::with_lines(vec![Line::raw("assistant")], Some(1)));
++    panel.cache.push(Segment::default());
++    panel.viewport_width = VIEW_WIDTH;
++    panel
++}
++
++#[test]
++fn transcript_anchors_map_display_messages_to_exact_rows() {
++    let panel = anchored_panel();
++    assert_eq!(
++        panel.transcript_anchors(),
++        vec![
++            TranscriptAnchor {
++                message_index: 0,
++                role: "user",
++                preview: "user preview".into(),
++                topline: 0,
++                height: 2,
++            },
++            TranscriptAnchor {
++                message_index: 1,
++                role: "assistant",
++                preview: "assistant preview".into(),
++                topline: 3,
++                height: 1,
++            },
++        ]
++    );
++}
++
++#[test]
++fn scroll_to_message_uses_the_first_matching_segment() {
++    let mut panel = anchored_panel();
++    assert!(panel.scroll_to_message(1));
++    assert_eq!(panel.scroll, ScrollPos { seg: 2, row: 0 });
++    assert!(!panel.auto_scroll);
++    assert!(!panel.scroll_to_message(99));
++    assert_eq!(panel.scroll, ScrollPos { seg: 2, row: 0 });
++}
++
++#[test]
++fn anchor_revision_tracks_anchor_changes_not_trailing_streaming_rows() {
++    let mut panel = anchored_panel();
++    let initial = panel.anchor_revision();
++    assert_eq!(initial, panel.anchor_revision());
++
++    panel.cache.push(Segment::with_lines(
++        vec![Line::raw("live one"), Line::raw("live two")],
++        None,
++    ));
++    assert_eq!(initial, panel.anchor_revision());
++
++    panel.messages[0].role = DisplayRole::Assistant;
++    let role_changed = panel.anchor_revision();
++    assert_ne!(initial, role_changed);
++
++    panel
++        .cache
++        .get_mut(0)
++        .unwrap()
++        .set_lines(vec![Line::raw("short")]);
++    let height_changed = panel.anchor_revision();
++    assert_ne!(role_changed, height_changed);
++
++    panel.viewport_width = 40;
++    let width_changed = panel.anchor_revision();
++    assert_ne!(height_changed, width_changed);
++    let view = panel.win_view();
++    assert_eq!(view.width, 40);
++    assert_eq!(view.anchor_revision, width_changed);
++}
++
++#[test]
++fn anchor_preview_is_empty_safe_and_unicode_bounded() {
++    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
++    assert!(panel.transcript_anchors().is_empty());
++
++    panel.messages = vec![DisplayMessage::new(
++        DisplayRole::User,
++        format!("{}\nignored", "é".repeat(ANCHOR_PREVIEW_CHARS + 1)),
++    )];
++    panel
++        .cache
++        .push(Segment::with_lines(vec![Line::raw("prompt")], Some(0)));
++    let anchors = panel.transcript_anchors();
++    assert_eq!(anchors[0].preview.chars().count(), ANCHOR_PREVIEW_CHARS);
++    assert!(!anchors[0].preview.contains("ignored"));
++}
++
+ #[test]
+ fn win_view_clamps_a_restored_offset_past_the_end() {
+     const LINES: u16 = 15;
+@@ -2130,7 +2232,11 @@ fn live_snapshot_uses_panel_generation() {
+     panel.tool_start(start("t1", BASH_TOOL_NAME));
+     panel.tool_snapshot("t1", rendered_snapshot(), None);
+ 
+-    assert_eq!(panel.snapshot_gen_of("t1"), Some(0), "{LIVE_PANEL_GEN_MSG}");
++    assert_eq!(
++        panel.snapshot_gen_of("t1"),
++        Some(panel.theme_generation),
++        "{LIVE_PANEL_GEN_MSG}"
++    );
+ }
+ 
+ #[test]
+diff --git a/maki-ui/src/event_loop.rs b/maki-ui/src/event_loop.rs
+index 297e314..03c1d9a 100644
+--- a/maki-ui/src/event_loop.rs
++++ b/maki-ui/src/event_loop.rs
+@@ -37,7 +37,7 @@ use maki_lua::session_snapshot::{
+ use maki_lua::{
+     EventHandle, HintReader, InputMode, InputRequest, InputRulesReader, Key, KeymapReader,
+     LuaCommandReader, ModelRequest, PackCommand, PackPreparation, PlanRequest, SessionEndReason,
+-    SessionRequest, TaskRequest, UiAction, UiAttachment, UiReply, WinEvent,
++    SessionRequest, TaskRequest, UiAction, UiAttachment, UiReply, WinEvent, WinScrollTarget,
+ };
+ use maki_providers::Timeouts;
+ use maki_providers::models_cache::{ModelList, fetch_all_models_cached};
+@@ -1087,9 +1087,15 @@ impl<'t> EventLoop<'t> {
+             UiAction::WinSaveView { reply_tx } => {
+                 let _ = reply_tx.send(self.focused_app().win_view());
+             }
+-            UiAction::WinRestView { scroll_top } => {
+-                self.focused_app().scroll_to_row(scroll_top);
++            UiAction::TranscriptAnchors { reply_tx } => {
++                let _ = reply_tx.send(self.focused_app().transcript_anchors());
+             }
++            UiAction::WinRestView { target } => match target {
++                WinScrollTarget::Row(scroll_top) => self.focused_app().scroll_to_row(scroll_top),
++                WinScrollTarget::Message(message_index) => {
++                    self.focused_app().scroll_to_message(message_index);
++                }
++            },
+             // Answered before dispatching, which can hold the loop for as long
+             // as `$EDITOR` is open.
+             UiAction::Builtin {
+diff --git a/plugins/maki.d.luau b/plugins/maki.d.luau
+index 4cde5ba..f305a33 100644
+--- a/plugins/maki.d.luau
++++ b/plugins/maki.d.luau
+@@ -68,6 +68,7 @@ declare maki: {
+     jobfind: @checked (name: string) -> (number?, string?),
+     executable: @checked (name: string) -> (number),
+     winsaveview: @checked () -> (any, string?),
++    transcript_anchors: @checked () -> (any, string?),
+     winrestview: @checked (view: any) -> (boolean?, string?),
+     mode: @checked () -> (string),
+   },
+diff --git a/site/docs/content/lua-api/_index.md b/site/docs/content/lua-api/_index.md
+index 6413595..7c81d33 100644
+--- a/site/docs/content/lua-api/_index.md
++++ b/site/docs/content/lua-api/_index.md
+@@ -2837,7 +2837,11 @@ the last visible one is `math.min(topline + height - 1, line_count)`.
+ `auto_scroll` has no Vim counterpart: it is true while the transcript
+ follows streaming output.
+ 
+-**Returns:** (`table|nil`, `string|nil`) `{topline, line_count, height, auto_scroll}`, or nil and an error.
++`width` is the transcript's layout width. `anchor_revision` is a string
++token that changes when a message anchor or its layout changes; clients can
++use it to avoid fetching unchanged anchors on every viewport poll.
++
++**Returns:** (`table|nil`, `string|nil`) `{topline, line_count, height, width, auto_scroll, anchor_revision}`, or nil and an error.
+ 
+ **Example:**
+ 
+@@ -2848,6 +2852,36 @@ maki.fn.winrestview({ topline = view.topline + 1 })
+ 
+ ---
+ 
++### `maki.fn.transcript_anchors()` {#maki-fn-transcript_anchors}
++
++```lua
++maki.fn.transcript_anchors()
++```
++
++Read message anchors from the focused display transcript, oldest first.
++Each entry has `{message_index, role, preview, topline, height}`. Indexes
++and toplines are one-based. `message_index` addresses this display
++transcript, not the raw session log, and can be passed to `winrestview`.
++`preview` is the message's first line, truncated to 80 Unicode characters.
++`height` is the exact rendered segment height at the current width.
++
++Requires the `session_read` [plugin permission](#plugin-permissions).
++
++Requires the `session_read` [plugin permission](#plugin-permissions).
++
++**Returns:** (`table|nil`, `string|nil`) Array of anchor tables, or nil and an error.
++
++**Example:**
++
++```lua
++local anchors = maki.fn.transcript_anchors()
++for _, anchor in ipairs(anchors or {}) do
++  if anchor.role == "user" then print(anchor.preview) end
++end
++```
++
++---
++
+ ### `maki.fn.winrestview()` {#maki-fn-winrestview}
+ 
+ ```lua
+@@ -2858,13 +2892,16 @@ Scroll the focused chat transcript so that the `topline` field of
+ {view} becomes the top visible line, like Neovim's
+ `vim.fn.winrestview()`. Out of range values are clamped. Other keys are
+ ignored, so a table straight from `winsaveview()` round-trips.
++Alternatively, `message_index` selects a one-based index returned by
++`transcript_anchors` and takes precedence over `topline`. A stale message
++index that is no longer in the display transcript does nothing.
+ 
+ Scrolling away from the bottom unpins the transcript; landing back at
+ the bottom re-pins it so streaming output keeps following.
+ 
+ **Parameters:**
+ 
+-- `{view}` (`table`) View to restore. Only `topline` (1-based) is read.
++- `{view}` (`table`) View to restore. `topline` and `message_index` are one-based.
+ 
+ **Returns:** (`boolean|nil`, `string|nil`) true on success, or nil and an error.
+ 
+@@ -2872,6 +2909,7 @@ the bottom re-pins it so streaming output keeps following.
+ 
+ ```lua
+ maki.fn.winrestview({ topline = 1 })
++maki.fn.winrestview({ message_index = 3 })
+ ```
+ 
+ ---
